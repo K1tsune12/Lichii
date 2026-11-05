@@ -63,6 +63,18 @@ void DrainBack() {
     VideoCommon::GpuSplit::Get().Drain(VideoCommon::DrainSite::Acquire);
 }
 
+// EDEN_NX2_ACQUIRE_PEEK=1 (from Selevet Eglantine): with the split active, an acquire whose value
+// is already in guest memory needs no drain. Work after it runs on the back after everything
+// queued before it anyway, and these semaphores count up, so a queued release cannot take a met
+// value back.
+bool PeekAcquire() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_ACQUIRE_PEEK");
+        return value != nullptr && value[0] == '1';
+    }();
+    return enabled && VideoCommon::GpuSplit::Get().Active();
+}
+
 // The fence manager records into the scheduler and downloads the CPU's writes over GPU data:
 // the back's state, which a drained back still uses from its idle hook (it submits).
 void ReleaseFences(DmaPusher& dma_pusher) {
@@ -88,6 +100,11 @@ bool Puller::PendingAcquire::Matches(u32 current) const {
 
 bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
     if (!pending_acquire) {
+        return true;
+    }
+    if (PeekAcquire() &&
+        (Nx2SemaphoreWaiters::Get().Latched(this) ||
+         pending_acquire->Matches(dma_pusher.memory_manager.Read<u32>(pending_acquire->address)))) {
         return true;
     }
     // The release may still be queued for the split GPU thread's back half (and the caches
@@ -256,6 +273,9 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
             return;
         }
         VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireChecks, 1);
+        if (PeekAcquire() && acquire.Matches(dma_pusher.memory_manager.Read<u32>(acquire.address))) {
+            return;
+        }
         DrainBack();
         if (acquire.Matches(ReadSemaphoreWord(dma_pusher, acquire.address))) {
             return;
@@ -345,6 +365,16 @@ void Puller::ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument) {
         return;
     }
     // Acquires: check once after flushing pending fences; never block the GPU thread on them.
+    // EDEN_NX2_SEMEXEC_DEFER=1 (from Selevet Eglantine): the check below only logs, so with the
+    // split the fences are released in order on the back instead of draining it.
+    static const bool semexec_defer = [] {
+        const char* value = std::getenv("EDEN_NX2_SEMEXEC_DEFER");
+        return value != nullptr && value[0] == '1';
+    }();
+    if (semexec_defer && VideoCommon::GpuSplit::Get().Active()) {
+        OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->ReleaseFences(); });
+        return;
+    }
     DrainBack();
     ReleaseFences(dma_pusher);
     const u32 word = dma_pusher.memory_manager.Read<u32>(address);
